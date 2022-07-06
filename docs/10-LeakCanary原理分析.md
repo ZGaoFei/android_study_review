@@ -1,0 +1,61 @@
+#### LeakCanary
+
+[LeakCanary原理分析](https://zhuanlan.zhihu.com/p/336448803)
+
+[LeakCanary原理解析](https://www.cnblogs.com/huansky/p/15489365.html)
+
+```
+1、LeakCanary主要是通过Application的registerActivityLifecycleCallbacks方法监控每一个Activty的Destroy之后对象是否被收回
+
+2、在Activity Destroy之后ActivityRefWatch的watch方法将被调用，watch方法会通过一个随机生成的key将这个弱引用关联到一个ReferenceQueue，然后调用ensureGone()；
+
+当一个软引用/弱引用对象被垃圾回收后，Java虚拟机就会把这个引用加入到与之关联的引用队列中；
+监测机制利用了Java的WeakReference和ReferenceQueue，通过将Activity包装到WeakReference中，被WeakReference包装过的Activity对象如果被回收，该WeakReference引用会被放到ReferenceQueue中，通过监测ReferenceQueue里面的内容就能检查到Activity是否能够被回收。
+
+3、ActivityRefWatch的ensureGone（）方法中会先确认一次是否已经被回收，如果发现没有被回收，则主动GC一下，然后再次确认是否被回收，如果还是没有回收则判断为内存泄漏；
+
+4、一旦确认是内存泄漏，则开始dump信息到hprof文件中，并调用heapdumpListener.analyze(heapDump)开始内存分析；
+
+5、内存分析是在HeapAnalyzerService服务中进行的，属于一个单独的进程；
+
+6、HeapAnalyzerService的runAnalysis中创建HeapAnalyzer对象并调用它的一个核心方法checkForLeak（）；
+
+7、HeapAnalyzer的checkForLeak（）会先解析hprof文件并生成快照文件，然后对快照中的泄漏对象进行去重，去重后根据第2步中的key去获取泄漏对象，如果对象为空则说明对象已经被回收，如果不为空则通过findLeakTrace（）方法计算出最短GC路径，并显示到DisplayLeakActivity页面，提醒开发者存在内存泄漏；
+
+原理：
+	监听Activity的onDestroy()方法被调用，然后将destroy的activity加入到一个列表里面，然后将activity放到WeakReference中与ReferenceQueue进行关联，如果activity被回收，就会将activity对象放到ReferenceQueue中，监听ReferenceQueue队列来判断activity有没有被回收（对比已经调用了onDestroy()的activity），如果泄露，则用运行在另一个进程中的Service分析泄露内容，通过解析hprof文件生成快照，然后通过去重处理，计算最短GC路径，然后显示出来提醒开发者
+```
+
+### 新的总结
+
+	1、LeakCanary 2.x 之后使用ContentProvider来进行初始化，因此是无感知的，只需要在 build.gradle 中导入包即可，因为只是在debug中使用，因此无需考虑启动耗时问题
+	
+	2、监听时机
+	Activity：通过注册application.registerActivityLifecycleCallbacks()监听onActivityDestroyed()方法，将destroy的Activity生成一个唯一的key并放入到map集合中，并监听与之关联的ReferenceQueue队列
+
+	Fragment：通过注册fragmentManager.registerFragmentLifecycleCallbacks()监听onFragmentViewDestroyed()和onFragmentDestroyed()方法
+	通过application.registerActivityLifecycleCallbacks()来监听onActivityCreated()来获取Activity对象，来获取fragmentManager对象
+	Fragment的实现不同，有v4包、AndroidX、app包下的
+
+	ViewModel：通过实现ViewModel，在onCleared()方法里来监听
+
+	RootView：通过监听View.addOnAttachStateChangeListener()监听onViewAttachedToWindow()和onViewDetachedFromWindow()
+
+	Service：比较复杂，通过反射和动态代理来获取Service的相关通知，通过把自己的CallBack替换mH的CallBack来获取回调
+
+	监听实现：
+	1、当一个对象需要被回收时,生成一个唯一的key,将它们封装进KeyedWeakReference中,并传入自定义的ReferenceQueue
+
+	2、将key和KeyedWeakReference放入一个map中
+
+	3、过一会儿之后(默认是5秒)主动触发GC,将自定义的ReferenceQueue中的KeyedWeakReference全部移除(它们所引用的对象已被回收),并同时根据这些KeyedWeakReference的key将map中的KeyedWeakReference也移除掉.
+	
+	4、此时如果map中还有KeyedWeakReference剩余,那么就是没有入队的,也就是说这些KeyedWeakReference所对应的对象还没被回收.这是不合理的,这里就产生了内存泄露.
+
+	5、将这些内存泄露的对象分析引用链最短路径,显示提示
+
+	问题：GC操作时，如果是WeakReference类型的对象就会被回收，为什么还能用WeakReference来包裹Activity对象监听，因为WeakReference类型的对象都会被回收
+
+	解答：因为如果WeakReference类型的对象没有强引用的话，就会被回收，如果有强引用引用这个对象的话，就无法被回收，正常情况下销毁的Activity对象应该被回收，但是还有强引用引用则可能出现了内存泄漏
+
+
